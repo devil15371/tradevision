@@ -1,0 +1,8 @@
+# TradeVision — Streamlit Cloud frontend dependencies
+# The heavy AI stack (torch, transformers, unsloth) runs on the H100 via Cloudflare tunnel.
+# This file is ONLY for the Streamlit UI frontend.
+
+streamlit>=1.39.0
+requests>=2.31.0
+PyMuPDF>=1.23.0        # fitz — PDF-to-image rendering for previews
+Pillow>=10.0.0

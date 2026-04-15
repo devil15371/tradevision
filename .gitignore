@@ -1,0 +1,38 @@
+# TradeVision — .gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+*.egg-info/
+
+# Model weights & large files
+models/tradevision_v2/
+models/checkpoints_v2/
+*.safetensors
+*.bin
+*.pt
+*.onnx
+
+# Generated data (regenerate with scripts)
+data/training/
+data/training_v2/
+data/ood_benchmark/
+training/dataset.jsonl
+
+# Logs
+logs/
+nohup.out
+
+# Secrets (NEVER commit these)
+.streamlit/secrets.toml
+
+# Outputs
+outputs/
+
+# OS
+.DS_Store
+*.swp
