@@ -275,7 +275,7 @@ def pdf_to_image(uploaded_file, scale: float = 1.8) -> Image.Image:
     return img
 
 
-def call_api(invoice_file, packing_file, endpoint="/check_v3"):
+def call_api(invoice_file, packing_file, endpoint="/check_v3", redact: bool = False):
     """POST both PDFs to the TradeVision API."""
     invoice_file.seek(0)
     packing_file.seek(0)
@@ -285,6 +285,7 @@ def call_api(invoice_file, packing_file, endpoint="/check_v3"):
             "invoice":      (invoice_file.name, invoice_file, "application/pdf"),
             "packing_list": (packing_file.name, packing_file, "application/pdf"),
         },
+        data={"redact_sensitive": "true" if redact else "false"},
         timeout=120,
     )
     resp.raise_for_status()
@@ -331,6 +332,17 @@ st.markdown("""
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
+# Redact toggle — shown above uploads
+redact_col, _ = st.columns([2, 3])
+with redact_col:
+    redact_on = st.toggle(
+        "🔒 Enable Auto-Redact  *(masks pricing & client names before AI scan)*",
+        value=False,
+        help="When ON, sensitive fields (prices, buyer names, emails) are blacked out BEFORE the Vision model sees the document. The redacted image is shown as proof."
+    )
+
+st.markdown('<br>', unsafe_allow_html=True)
+
 # Upload row
 col_inv, col_pl = st.columns(2)
 with col_inv:
@@ -371,6 +383,15 @@ if invoice_file and packing_file:
     with btn_col:
         analyse = st.button("🔍  Run Compliance Check", type="primary", use_container_width=True)
 
+    if redact_on:
+        st.markdown("""
+        <div style='text-align:center;background:rgba(167,139,250,0.1);border:1px solid rgba(167,139,250,0.3);
+            border-radius:10px;padding:0.6rem 1rem;color:#c4b5fd;font-size:0.85rem;margin-bottom:0.5rem'>
+            🔒 Auto-Redact ON — Sensitive fields will be blacked out before the AI scan.
+            Redacted images will be shown as proof after processing.
+        </div>
+        """, unsafe_allow_html=True)
+
     if analyse:
         # Scanning animation
         progress_area = st.empty()
@@ -398,7 +419,7 @@ if invoice_file and packing_file:
 
         # Actual API call
         try:
-            result = call_api(invoice_file, packing_file, "/check_v3")
+            result = call_api(invoice_file, packing_file, "/check_v3", redact=redact_on)
             prog.progress(100)
             time.sleep(0.2)
             progress_area.empty()
@@ -550,6 +571,37 @@ if invoice_file and packing_file:
                 st.markdown(f"""<div style='background:rgba(30,58,138,0.3);border:1px solid rgba(96,165,250,0.2);
                     border-radius:10px;padding:0.85rem 1rem;color:#bfdbfe;font-size:0.85rem;
                     font-style:italic'>"{vlm_summary}"</div>""", unsafe_allow_html=True)
+
+        # Redacted image proof
+        if result.get("redaction_applied") and result.get("redacted_images"):
+            import base64
+            st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            st.markdown('<div class="section-header">🔒 Redacted Images Sent to AI (Visual Proof)</div>', unsafe_allow_html=True)
+            st.markdown("""
+            <div style='background:rgba(167,139,250,0.1);border:1px solid rgba(167,139,250,0.25);
+                border-radius:10px;padding:0.75rem 1rem;color:#c4b5fd;font-size:0.83rem;margin-bottom:0.75rem'>
+                The images below are exactly what the Vision model saw. All sensitive fields
+                (prices, buyer names, emails) have been replaced with black boxes
+                <strong>before</strong> any AI processing occurred.
+            </div>
+            """, unsafe_allow_html=True)
+            rc1, rc2 = st.columns(2)
+            imgs = result["redacted_images"]
+            if "invoice" in imgs:
+                with rc1:
+                    import io as _io
+                    raw = base64.b64decode(imgs["invoice"])
+                    img_obj = Image.open(_io.BytesIO(raw))
+                    st.markdown('<div class="doc-frame"><div class="doc-label">🔒 Redacted Invoice</div>', unsafe_allow_html=True)
+                    st.image(img_obj, use_container_width=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+            if "packing_list" in imgs:
+                with rc2:
+                    raw = base64.b64decode(imgs["packing_list"])
+                    img_obj = Image.open(_io.BytesIO(raw))
+                    st.markdown('<div class="doc-frame"><div class="doc-label">🔒 Redacted Packing List</div>', unsafe_allow_html=True)
+                    st.image(img_obj, use_container_width=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
 
         # Raw JSON expander
         st.markdown('<hr class="divider">', unsafe_allow_html=True)

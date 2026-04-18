@@ -1,9 +1,11 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import tempfile
 import os
 import sys
+import base64
+import io
 import logging
 
 logger = logging.getLogger(__name__)
@@ -15,6 +17,7 @@ from extraction.compare import compare_invoice_packing_list
 from models.llm_extractor import LLMExtractor
 from models.rag_checker import RAGChecker
 from models.vlm_extractor import VLMExtractor
+from models.redactor import redact_image
 
 # ── Singletons — loaded once at startup ──────────────────────────
 _extractor: LLMExtractor = None
@@ -204,7 +207,8 @@ async def check_full(
 @app.post("/check_v3")
 async def check_v3(
     invoice: UploadFile = File(...),
-    packing_list: UploadFile = File(...)
+    packing_list: UploadFile = File(...),
+    redact_sensitive: bool = Form(False),
 ):
     """
     Phase 3: VLM-powered compliance check.
@@ -244,6 +248,24 @@ async def check_v3(
 
         inv_img = _pdf_to_pil(tmp_invoice.name)
         pl_img  = _pdf_to_pil(tmp_packing.name)
+
+        # ── Optional: Redact sensitive fields before VLM sees them ──
+        redacted_images_b64: dict = {}
+        if redact_sensitive:
+            logger.info("[Redactor] Running GPU redaction on invoice + packing list...")
+            inv_img = redact_image(inv_img, use_gpu=True)
+            pl_img  = redact_image(pl_img,  use_gpu=True)
+
+            def _pil_to_b64(img):
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                return base64.b64encode(buf.getvalue()).decode()
+
+            redacted_images_b64 = {
+                "invoice":      _pil_to_b64(inv_img),
+                "packing_list": _pil_to_b64(pl_img),
+            }
+            logger.info("[Redactor] Redaction complete.")
 
         # ── Phase 3: VLM visual extraction ───────────────────────
         vlm_result = _vlm_extractor.extract(inv_img, pl_img)
@@ -302,6 +324,8 @@ async def check_v3(
             "status":             final_status,
             "invoice_file":       invoice.filename,
             "packing_list_file":  packing_list.filename,
+            "redaction_applied":  redact_sensitive,
+            "redacted_images":    redacted_images_b64,
             "vlm_result": {
                 "status":  vlm_status,
                 "issues":  vlm_issues,
