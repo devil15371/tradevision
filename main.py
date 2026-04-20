@@ -18,6 +18,7 @@ from models.llm_extractor import LLMExtractor
 from models.rag_checker import RAGChecker
 from models.vlm_extractor import VLMExtractor
 from models.redactor import redact_image
+from agents.workflow import run_hmas_workflow
 
 # ── Singletons — loaded once at startup ──────────────────────────
 _extractor: LLMExtractor = None
@@ -42,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TradeVision API",
     description="AI-powered trade document compliance checker for Indian exporters",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -51,11 +52,12 @@ app = FastAPI(
 def root():
     return {
         "message": "TradeVision API is running",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "endpoints": {
-            "/compare":   "Phase 1 — regex-based document comparison",
+            "/compare":    "Phase 1 — regex-based document comparison",
             "/check_full": "Phase 2 — regex + LLM field extraction + RAG compliance",
             "/check_v3":   "Phase 3 — VLM visual extraction + RAG compliance",
+            "/check_v4":   "Phase 4 — HMAS: Supervisor (Qwen3-30B-A3B) + VLM + Regex + RAG agents",
         }
     }
 
@@ -348,6 +350,127 @@ async def check_v3(
                 "regulatory_flags_count": len(regulatory_flags),
                 "critical_flags":        sum(1 for f in regulatory_flags if f["severity"] == "CRITICAL"),
             }
+        }
+
+    finally:
+        os.unlink(tmp_invoice.name)
+        os.unlink(tmp_packing.name)
+
+# ── Phase 4: HMAS endpoint ────────────────────────────────────────
+
+@app.post("/check_v4")
+async def check_v4(
+    invoice: UploadFile = File(...),
+    packing_list: UploadFile = File(...),
+    redact_sensitive: bool = Form(False),
+):
+    """
+    Phase 4: Hierarchical Multi-Agent System (HMAS).
+
+    Pipeline (LangGraph):
+      ┌─ VLM Worker    (Qwen2-VL-7B, parallel) ─┐
+      │                                            ├─► RAG Worker ─► Supervisor (Qwen3-30B-A3B) ─► Verdict
+      └─ Regex Worker  (deterministic, parallel)  ─┘
+
+    Returns full worker traces + Supervisor audit report.
+    """
+    import fitz
+    from PIL import Image as PILImage
+
+    for f in [invoice, packing_list]:
+        if not f.filename.endswith(".pdf"):
+            raise HTTPException(status_code=400, detail=f"{f.filename} must be a PDF")
+
+    tmp_invoice = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp_packing = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+
+    try:
+        tmp_invoice.write(await invoice.read())
+        tmp_invoice.close()
+        tmp_packing.write(await packing_list.read())
+        tmp_packing.close()
+
+        # ── PDF → PIL ───────────────────────────────────────────
+        def _pdf_to_pil(path: str) -> PILImage.Image:
+            doc = fitz.open(path)
+            pix = doc[0].get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+            img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            doc.close()
+            return img
+
+        inv_img = _pdf_to_pil(tmp_invoice.name)
+        pl_img  = _pdf_to_pil(tmp_packing.name)
+
+        # ── Optional redaction before agents see documents ───────
+        if redact_sensitive:
+            inv_img = redact_image(inv_img, use_gpu=True)
+            pl_img  = redact_image(pl_img,  use_gpu=True)
+
+        # ── Run HMAS workflow ────────────────────────────────────
+        result = run_hmas_workflow(
+            inv_img=inv_img,
+            pl_img=pl_img,
+            inv_pdf_path=tmp_invoice.name,
+            pl_pdf_path=tmp_packing.name,
+        )
+
+        # ── Serialise (PIL images are not JSON-serialisable) ─────
+        sup   = result.get("supervisor_result", {})
+        vlm   = result.get("vlm_result", {})
+        regex = result.get("regex_result", {})
+        rag   = result.get("rag_result", [])
+        fields = result.get("document_fields", {})
+        final_status = result.get("final_status", "NEEDS_REVIEW")
+
+        return {
+            "status":              final_status,
+            "invoice_file":        invoice.filename,
+            "packing_list_file":   packing_list.filename,
+            "redaction_applied":   redact_sensitive,
+            "supervisor_available": result.get("supervisor_available", False),
+
+            # Supervisor synthesis
+            "supervisor": {
+                "final_status":          sup.get("final_status", final_status),
+                "confidence":            sup.get("confidence", "LOW"),
+                "audit_report":          sup.get("audit_report", ""),
+                "risk_summary":          sup.get("risk_summary"),
+                "key_issues":            sup.get("key_issues", []),
+                "supervisor_reasoning":  sup.get("supervisor_reasoning", ""),
+            },
+
+            # Worker traces
+            "agent_trace": {
+                "vlm_worker": {
+                    "status":      vlm.get("status"),
+                    "issues":      vlm.get("issues", []),
+                    "summary":     vlm.get("summary", ""),
+                    "parse_error": vlm.get("parse_error", False),
+                },
+                "regex_worker": {
+                    "status":   regex.get("status"),
+                    "issues":   regex.get("issues", []),
+                    "warnings": regex.get("warnings", []),
+                },
+                "rag_worker": {
+                    "flags_count":  len(rag),
+                    "critical":     sum(1 for f in rag if f.get("severity") == "CRITICAL"),
+                    "flags":        rag,
+                },
+            },
+
+            "document_fields":  fields,
+            "regulatory_flags": rag,
+
+            "summary": {
+                "final_status":           final_status,
+                "vlm_status":             vlm.get("status"),
+                "regex_status":           regex.get("status"),
+                "total_issues":           len(vlm.get("issues", [])) + len(regex.get("issues", [])),
+                "regulatory_flags_count": len(rag),
+                "critical_flags":         sum(1 for f in rag if f.get("severity") == "CRITICAL"),
+                "supervisor_confidence":  sup.get("confidence", "LOW"),
+            },
         }
 
     finally:

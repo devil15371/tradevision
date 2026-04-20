@@ -275,6 +275,12 @@ def pdf_to_image(uploaded_file, scale: float = 1.8) -> Image.Image:
     return img
 
 
+# Pull hmas_on from sidebar (set above). Default False so variable always exists.
+try:
+    _ = hmas_on  # already defined in sidebar block at bottom of file
+except NameError:
+    hmas_on = False
+
 def call_api(invoice_file, packing_file, endpoint="/check_v3", redact: bool = False):
     """POST both PDFs to the TradeVision API."""
     invoice_file.seek(0)
@@ -419,7 +425,8 @@ if invoice_file and packing_file:
 
         # Actual API call
         try:
-            result = call_api(invoice_file, packing_file, "/check_v3", redact=redact_on)
+            _endpoint = "/check_v4" if hmas_on else "/check_v3"
+            result = call_api(invoice_file, packing_file, _endpoint, redact=redact_on)
             prog.progress(100)
             time.sleep(0.2)
             progress_area.empty()
@@ -603,10 +610,60 @@ if invoice_file and packing_file:
                     st.image(img_obj, use_container_width=True)
                     st.markdown('</div>', unsafe_allow_html=True)
 
+        # ── Supervisor Audit Report (HMAS mode only) ───────────────
+        supervisor_data = result.get("supervisor")
+        if supervisor_data:
+            st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            conf_color = {"HIGH": "#34d399", "MEDIUM": "#fbbf24", "LOW": "#f87171"}.get(
+                supervisor_data.get("confidence", "LOW"), "#94a3b8"
+            )
+            st.markdown(f"""
+            <div style='background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.35);
+                border-radius:16px;padding:1.5rem;margin:0.5rem 0'>
+                <div style='font-size:0.7rem;font-weight:600;letter-spacing:0.1em;
+                    text-transform:uppercase;color:#818cf8;margin-bottom:0.75rem'>
+                    🏆 Supervisor Audit Report
+                    <span style='margin-left:0.75rem;background:rgba(99,102,241,0.2);
+                        border-radius:20px;padding:0.15rem 0.6rem;font-size:0.65rem;color:{conf_color}'>
+                        {supervisor_data.get("confidence","?")} CONFIDENCE
+                    </span>
+                    {'<span style="margin-left:0.5rem;color:#fbbf24;font-size:0.65rem">⚠️ FALLBACK MODE</span>'
+                     if not result.get("supervisor_available") else ''}
+                </div>
+                <div style='color:#e2e8f0;font-size:0.92rem;line-height:1.6;margin-bottom:1rem'>
+                    {supervisor_data.get("audit_report","")}</div>
+                {'<div style="background:rgba(248,113,113,0.1);border-left:3px solid #f87171;border-radius:0 8px 8px 0;padding:0.75rem 1rem;color:#fca5a5;font-size:0.85rem"><strong>⚖️ Risk:</strong> ' + supervisor_data.get("risk_summary","") + '</div>'
+                 if supervisor_data.get("risk_summary") else ''}
+                {'<div style="margin-top:0.75rem;color:#94a3b8;font-size:0.78rem;font-style:italic">Reasoning: '
+                 + supervisor_data.get("supervisor_reasoning","") + '</div>'
+                 if supervisor_data.get("supervisor_reasoning") else ''}
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Agent Trace expander
+            agent_trace = result.get("agent_trace", {})
+            if agent_trace:
+                with st.expander("🔬 Agent Trace — all worker outputs"):
+                    tc1, tc2, tc3 = st.columns(3)
+                    with tc1:
+                        vlm_t = agent_trace.get("vlm_worker", {})
+                        st.markdown(f"**🤖 VLM Worker**  \nStatus: `{vlm_t.get('status','?')}`  \nIssues: `{len(vlm_t.get('issues',[]))}`")
+                        if vlm_t.get("summary"):
+                            st.caption(vlm_t["summary"][:120])
+                    with tc2:
+                        rx_t = agent_trace.get("regex_worker", {})
+                        st.markdown(f"**📏 Regex Worker**  \nStatus: `{rx_t.get('status','?')}`  \nIssues: `{len(rx_t.get('issues',[]))}`")
+                        for iss in rx_t.get("issues", []):
+                            st.caption(f"• {iss.get('type','')}: {iss.get('detail','')[:60]}")
+                    with tc3:
+                        rag_t = agent_trace.get("rag_worker", {})
+                        st.markdown(f"**📚 RAG Worker**  \nFlags: `{rag_t.get('flags_count',0)}`  \nCritical: `{rag_t.get('critical',0)}`")
+
         # Raw JSON expander
         st.markdown('<hr class="divider">', unsafe_allow_html=True)
         with st.expander("🔧 Raw API Response (JSON)"):
             st.json(result)
+
 
 else:
     # Empty state guidance
@@ -656,7 +713,7 @@ else:
 
 # Sidebar — about
 with st.sidebar:
-    st.markdown("### 🛡️ TradeVision v0.3")
+    st.markdown("### 🛡️ TradeVision v0.4")
     st.markdown("""
     **AI compliance check for Indian exporters.**
 
@@ -664,6 +721,7 @@ with st.sidebar:
     1. 🤖 Qwen2-VL-7B visual scan
     2. 📏 Regex cross-validation
     3. 📚 RAG → 18 customs rules
+    4. 🏆 Supervisor → Qwen3-30B-A3B
 
     **Detects:**
     - Weight mismatches
@@ -677,7 +735,23 @@ with st.sidebar:
     """)
     st.markdown("---")
 
-    # Quick health check
+    # Multi-Agent Mode toggle
+    hmas_on = st.toggle(
+        "🏺 Multi-Agent Mode",
+        value=False,
+        help="Enables the Qwen3-30B-A3B Supervisor agent. Falls back gracefully if vLLM is unavailable."
+    )
+    if hmas_on:
+        st.markdown("""
+        <div style='background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);
+            border-radius:8px;padding:0.5rem 0.75rem;color:#fbbf24;font-size:0.78rem;margin-bottom:0.5rem'>
+            🏆 <b>HMAS Active</b><br>Supervisor will synthesize all agents and write a legal audit report.
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # API health check
     try:
         r = requests.get(f"{API_URL}/health", timeout=2)
         if r.status_code == 200:
@@ -687,3 +761,12 @@ with st.sidebar:
     except:
         st.error("❌ API Offline")
         st.caption("Start with: `uvicorn main:app --port 8000`")
+
+    # Supervisor health check
+    if hmas_on:
+        try:
+            requests.get("http://localhost:8001/health", timeout=1)
+            st.success("✅ Supervisor Online")
+        except:
+            st.warning("⚠️ Supervisor Offline (fallback mode)")
+            st.caption("Start: `python agents/start_supervisor.py`")
